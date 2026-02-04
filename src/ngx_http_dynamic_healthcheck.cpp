@@ -37,6 +37,11 @@ ngx_http_dynamic_healthcheck_status(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 
 
+static char *
+ngx_http_dynamic_upstream_handler(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+
+
 static ngx_command_t ngx_http_dynamic_healthcheck_commands[] = {
 
     { ngx_string("healthcheck"),
@@ -1557,6 +1562,10 @@ ngx_http_dynamic_healthcheck_status(ngx_conf_t *cf,
 static ngx_int_t
 ngx_http_dynamic_upstream_handler_func(ngx_http_request_t *r);
 
+static char *
+ngx_http_dynamic_upstream_handler(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+
 
 /* Simple JSON parser helper - extract value from JSON string */
 static ngx_int_t
@@ -1576,7 +1585,7 @@ parse_json_value(ngx_str_t *json, const char *key, ngx_str_t *value)
             p++;
             while (p < end && *p != '"') p++;
             if (p < end && ngx_memcmp(start, key_str.data, key_len) == 0 &&
-                p - start == key_len) {
+                (size_t)(p - start) == key_len) {
                 /* Found key, skip to value */
                 p++;
                 while (p < end && (*p == ' ' || *p == ':' || *p == '\t')) p++;
@@ -1639,7 +1648,7 @@ parse_json_request(ngx_http_request_t *r, ngx_dynamic_upstream_server_t *server_
         return NGX_DECLINED;
     }
 
-    body.data = ngx_pcalloc(r->pool, body.len + 1);
+    body.data = (u_char *) ngx_pcalloc(r->pool, body.len + 1);
     if (body.data == NULL) {
         return NGX_ERROR;
     }
@@ -1724,7 +1733,7 @@ ngx_http_dynamic_upstream_handler_impl(ngx_http_request_t *r)
     ngx_str_t                      upstream_name;
     ngx_str_t                      output;
     ngx_str_t                      action = ngx_null_string;
-    ngx_int_t                       rc;
+    ngx_int_t                       rc = NGX_ERROR; /* Initialize to error by default */
     ngx_chain_t                    *out;
     static ngx_str_t                json_type = ngx_string("application/json");
     static ngx_str_t                text = ngx_string("text/plain");
@@ -1741,14 +1750,8 @@ ngx_http_dynamic_upstream_handler_impl(ngx_http_request_t *r)
         if (r->headers_in.content_type != NULL &&
             r->headers_in.content_type->value.len >= 16 &&
             ngx_memcmp(r->headers_in.content_type->value.data, "application/json", 16) == 0) {
-            /* Read request body */
-            if (r->request_body == NULL) {
-                rc = ngx_http_read_client_request_body(r, NULL);
-                if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
-                    return rc;
-                }
-            }
             
+            /* Request body should already be read by handler_func callback */
             if (r->request_body != NULL && r->request_body->bufs != NULL) {
                 if (parse_json_request(r, &server_params, &upstream_name, &action) == NGX_OK) {
                     use_json = 1;
@@ -1776,60 +1779,73 @@ ngx_http_dynamic_upstream_handler_impl(ngx_http_request_t *r)
             return rc;
         }
 
-    upstream = get_arg(r, "arg_upstream");
-    server = get_arg(r, "arg_server");
-    add = get_arg(r, "arg_add");
-    remove = get_arg(r, "arg_remove");
-    weight = get_arg(r, "arg_weight");
-    max_fails = get_arg(r, "arg_max_fails");
-    fail_timeout = get_arg(r, "arg_fail_timeout");
-    max_conns = get_arg(r, "arg_max_conns");
-    backup = get_arg(r, "arg_backup");
-    down = get_arg(r, "arg_down");
-    up = get_arg(r, "arg_up");
+        upstream = get_arg(r, "arg_upstream");
+        server = get_arg(r, "arg_server");
+        ngx_http_variable_value_t *action_param = get_arg(r, "arg_action");
+        add = get_arg(r, "arg_add");
+        remove = get_arg(r, "arg_remove");
+        weight = get_arg(r, "arg_weight");
+        max_fails = get_arg(r, "arg_max_fails");
+        fail_timeout = get_arg(r, "arg_fail_timeout");
+        max_conns = get_arg(r, "arg_max_conns");
+        backup = get_arg(r, "arg_backup");
+        down = get_arg(r, "arg_down");
+        up = get_arg(r, "arg_up");
+        
+        /* Handle action parameter if present */
+        if (!action_param->not_found) {
+            if (action_param->len == 3 && ngx_memcmp(action_param->data, "add", 3) == 0) {
+                add = action_param; /* Use action_param as add flag */
+            } else if (action_param->len == 6 && ngx_memcmp(action_param->data, "remove", 6) == 0) {
+                remove = action_param; /* Use action_param as remove flag */
+            } else if (action_param->len == 6 && ngx_memcmp(action_param->data, "update", 6) == 0) {
+                /* Update action - will be handled by checking if server and params are present */
+            }
+        }
 
-    if (upstream->not_found) {
-        r->headers_out.status = NGX_HTTP_BAD_REQUEST;
-        return NGX_HTTP_BAD_REQUEST;
+        if (upstream->not_found) {
+            r->headers_out.status = NGX_HTTP_BAD_REQUEST;
+            return NGX_HTTP_BAD_REQUEST;
+        }
+
+        upstream_name.data = upstream->data;
+        upstream_name.len = upstream->len;
+
+        ngx_memzero(&server_params, sizeof(ngx_dynamic_upstream_server_t));
+
+        /* Parse server parameters */
+        if (!server->not_found) {
+            server_params.server.data = server->data;
+            server_params.server.len = server->len;
+        }
+
+        if (!weight->not_found) {
+            server_params.weight = ngx_atoi(weight->data, weight->len);
+        } else {
+            server_params.weight = -1; /* Don't update */
+        }
+
+        if (!max_fails->not_found) {
+            server_params.max_fails = ngx_atoi(max_fails->data, max_fails->len);
+        } else {
+            server_params.max_fails = -1;
+        }
+
+        if (!fail_timeout->not_found) {
+            server_params.fail_timeout = ngx_atoi(fail_timeout->data, fail_timeout->len);
+        } else {
+            server_params.fail_timeout = -1;
+        }
+
+        if (!max_conns->not_found) {
+            server_params.max_conns = ngx_atoi(max_conns->data, max_conns->len);
+        } else {
+            server_params.max_conns = -1;
+        }
+
+        server_params.backup = backup->not_found ? -1 : 1;
+        server_params.down = down->not_found ? (up->not_found ? -1 : 0) : 1;
     }
-
-    upstream_name.data = upstream->data;
-    upstream_name.len = upstream->len;
-
-    ngx_memzero(&server_params, sizeof(ngx_dynamic_upstream_server_t));
-
-    /* Parse server parameters */
-    if (!server->not_found) {
-        server_params.server.data = server->data;
-        server_params.server.len = server->len;
-    }
-
-    if (!weight->not_found) {
-        server_params.weight = ngx_atoi(weight->data, weight->len);
-    } else {
-        server_params.weight = -1; /* Don't update */
-    }
-
-    if (!max_fails->not_found) {
-        server_params.max_fails = ngx_atoi(max_fails->data, max_fails->len);
-    } else {
-        server_params.max_fails = -1;
-    }
-
-    if (!fail_timeout->not_found) {
-        server_params.fail_timeout = ngx_atoi(fail_timeout->data, fail_timeout->len);
-    } else {
-        server_params.fail_timeout = -1;
-    }
-
-    if (!max_conns->not_found) {
-        server_params.max_conns = ngx_atoi(max_conns->data, max_conns->len);
-    } else {
-        server_params.max_conns = -1;
-    }
-
-    server_params.backup = backup->not_found ? -1 : 1;
-    server_params.down = down->not_found ? (up->not_found ? -1 : 0) : 1;
 
     /* Handle different operations - use action from JSON or determine from query params */
     if (use_json && action.len > 0) {
@@ -1939,39 +1955,48 @@ ngx_http_dynamic_upstream_handler_impl(ngx_http_request_t *r)
             ngx_str_t server_addr = { server->len, server->data };
             rc = ngx_dynamic_upstream_update_server(&upstream_name, &server_addr, &server_params, r->connection->log);
         } else {
-        /* List servers */
-        rc = ngx_dynamic_upstream_list_servers(&upstream_name, &output, r->pool, r->connection->log);
-        if (rc == NGX_OK) {
-            out = ngx_alloc_chain_link(r->pool);
-            if (out == NULL) {
-                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            /* List servers */
+            rc = ngx_dynamic_upstream_list_servers(&upstream_name, &output, r->pool, r->connection->log);
+            if (rc == NGX_OK) {
+                out = ngx_alloc_chain_link(r->pool);
+                if (out == NULL) {
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+
+                out->buf = ngx_create_temp_buf(r->pool, output.len);
+                if (out->buf == NULL) {
+                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                }
+
+                ngx_memcpy(out->buf->last, output.data, output.len);
+                out->buf->last += output.len;
+                out->buf->last_buf = 1;
+                out->buf->last_in_chain = 1;
+                out->next = NULL;
+
+                r->headers_out.status = NGX_HTTP_OK;
+                r->headers_out.content_type = use_json ? json_type : text;
+                r->headers_out.content_length_n = output.len;
+
+                rc = ngx_http_send_header(r);
+                if (rc == NGX_ERROR || rc > NGX_OK) {
+                    return rc;
+                }
+
+                return ngx_http_output_filter(r, out);
             }
-
-            out->buf = ngx_create_temp_buf(r->pool, output.len);
-            if (out->buf == NULL) {
-                return NGX_HTTP_INTERNAL_SERVER_ERROR;
-            }
-
-            ngx_memcpy(out->buf->last, output.data, output.len);
-            out->buf->last += output.len;
-            out->buf->last_buf = 1;
-            out->buf->last_in_chain = 1;
-            out->next = NULL;
-
-            r->headers_out.status = NGX_HTTP_OK;
-            r->headers_out.content_type = use_json ? json_type : text;
-            r->headers_out.content_length_n = output.len;
-
-            rc = ngx_http_send_header(r);
-            if (rc == NGX_ERROR || rc > NGX_OK) {
-                return rc;
-            }
-
-            return ngx_http_output_filter(r, out);
         }
     }
 
     /* Prepare response */
+    /* Prevent caching */
+    r->headers_out.cache_control = (ngx_table_elt_t *) ngx_list_push(&r->headers_out.headers);
+    if (r->headers_out.cache_control != NULL) {
+        r->headers_out.cache_control->hash = 1;
+        ngx_str_set(&r->headers_out.cache_control->key, "Cache-Control");
+        ngx_str_set(&r->headers_out.cache_control->value, "no-cache, no-store, must-revalidate");
+    }
+    
     out = ngx_alloc_chain_link(r->pool);
     if (out == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -2062,9 +2087,42 @@ ngx_http_dynamic_upstream_handler_impl(ngx_http_request_t *r)
 }
 
 
+/* Callback for reading request body */
+static void
+ngx_http_dynamic_upstream_read_body_handler(ngx_http_request_t *r)
+{
+    ngx_int_t rc = ngx_http_dynamic_upstream_handler_impl(r);
+    
+    if (rc == NGX_DONE) {
+        ngx_http_finalize_request(r, NGX_DONE);
+    } else {
+        ngx_http_finalize_request(r, rc);
+    }
+}
+
 static ngx_int_t
 ngx_http_dynamic_upstream_handler_func(ngx_http_request_t *r)
 {
+    /* For POST/PUT/DELETE with JSON, we need to read body first */
+    if ((r->method == NGX_HTTP_POST || r->method == NGX_HTTP_PUT || r->method == NGX_HTTP_DELETE) &&
+        r->headers_in.content_type != NULL &&
+        r->headers_in.content_type->value.len >= 16 &&
+        ngx_memcmp(r->headers_in.content_type->value.data, "application/json", 16) == 0) {
+        
+        if (r->request_body == NULL) {
+            /* Read request body with callback */
+            ngx_int_t rc = ngx_http_read_client_request_body(r, ngx_http_dynamic_upstream_read_body_handler);
+            if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+                return rc;
+            }
+            if (rc == NGX_AGAIN) {
+                /* Body reading is in progress, callback will be called */
+                return NGX_DONE;
+            }
+            /* Body already read synchronously, continue */
+        }
+    }
+    
     return ngx_http_dynamic_upstream_handler_impl(r);
 }
 

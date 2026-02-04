@@ -3,7 +3,9 @@
  * Extends ngx_dynamic_healthcheck with dynamic server addition/removal
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE  /* For getline */
+#endif
 
 #include "ngx_dynamic_upstream.h"
 #include "ngx_dynamic_healthcheck_api.h"
@@ -17,6 +19,10 @@ extern "C" {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 }
 
 extern ngx_module_t ngx_http_x5digital_dynamic_hc_module;
@@ -42,6 +48,9 @@ find_http_upstream(ngx_str_t *upstream_name)
     uscfp = (ngx_http_upstream_srv_conf_t **) umcf->upstreams.elts;
 
     for (i = 0; i < umcf->upstreams.nelts; i++) {
+        if (uscfp[i] == NULL || uscfp[i]->host.len == 0) {
+            continue;
+        }
         if (uscfp[i]->host.len == upstream_name->len &&
             ngx_memcmp(uscfp[i]->host.data, upstream_name->data,
                       upstream_name->len) == 0) {
@@ -87,6 +96,13 @@ resolve_address(ngx_str_t *host, ngx_int_t port, ngx_addr_t *addr,
     u_char      *p;
     ngx_str_t    addr_str;
     u_char       buf[NGX_SOCKADDR_STRLEN];
+    ngx_int_t    rc;
+    struct addrinfo hints, *res, *rp;
+    char         *hostname;
+    int           err;
+
+    /* Initialize addr structure */
+    ngx_memzero(addr, sizeof(ngx_addr_t));
 
     /* Check if it's an IP address */
     p = host->data;
@@ -103,27 +119,62 @@ resolve_address(ngx_str_t *host, ngx_int_t port, ngx_addr_t *addr,
         addr_str.len = ngx_snprintf(buf, NGX_SOCKADDR_STRLEN, "%V:%d", host, port) - buf;
         addr_str.data = buf;
         
-        if (ngx_parse_addr_port(pool, addr, addr_str.data, addr_str.len) == NGX_OK) {
+        rc = ngx_parse_addr_port(pool, addr, addr_str.data, addr_str.len);
+        if (rc == NGX_OK && addr->sockaddr != NULL && addr->socklen > 0) {
             return NGX_OK;
         }
     }
 
-    /* Domain name - try to resolve using ngx_parse_addr_port */
-    /* This will work if domain resolves to IP, but won't do async DNS */
-    addr_str.len = ngx_snprintf(buf, NGX_SOCKADDR_STRLEN, "%V:%d", host, port) - buf;
-    addr_str.data = buf;
-    
-    if (ngx_parse_addr_port(pool, addr, addr_str.data, addr_str.len) == NGX_OK) {
-        return NGX_OK;
+    /* Domain name - use getaddrinfo for DNS resolution */
+    hostname = (char *) ngx_palloc(pool, host->len + 1);
+    if (hostname == NULL) {
+        return NGX_ERROR;
     }
-
-    /* DNS resolution failed - log warning but allow to continue */
-    /* Note: For production use, async DNS resolution should be implemented */
-    ngx_log_error(NGX_LOG_WARN, log, 0,
-                  "DNS resolution for %V:%d failed, server may not be reachable",
-                  host, port);
-    /* Still try to create peer with unresolved address */
-    /* The actual connection will fail if DNS doesn't resolve */
+    ngx_memcpy(hostname, host->data, host->len);
+    hostname[host->len] = '\0';
+    
+    /* Resolve hostname only, then set port manually */
+    ngx_memzero(&hints, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    
+    err = getaddrinfo(hostname, NULL, &hints, &res); /* NULL for service to avoid service lookup */
+    if (err != 0) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                      "DNS resolution for %V failed: %s", host, gai_strerror(err));
+        return NGX_ERROR;
+    }
+    
+    /* Use first result and set port manually */
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        if (rp->ai_family == AF_INET) {
+            addr->socklen = sizeof(struct sockaddr_in);
+            addr->sockaddr = (struct sockaddr *) ngx_palloc(pool, addr->socklen);
+            if (addr->sockaddr == NULL) {
+                freeaddrinfo(res);
+                return NGX_ERROR;
+            }
+            ngx_memcpy(addr->sockaddr, rp->ai_addr, rp->ai_addrlen);
+            ((struct sockaddr_in *)addr->sockaddr)->sin_port = htons(port);
+            freeaddrinfo(res);
+            return NGX_OK;
+        } else if (rp->ai_family == AF_INET6) {
+            addr->socklen = sizeof(struct sockaddr_in6);
+            addr->sockaddr = (struct sockaddr *) ngx_palloc(pool, addr->socklen);
+            if (addr->sockaddr == NULL) {
+                freeaddrinfo(res);
+                return NGX_ERROR;
+            }
+            ngx_memcpy(addr->sockaddr, rp->ai_addr, rp->ai_addrlen);
+            ((struct sockaddr_in6 *)addr->sockaddr)->sin6_port = htons(port);
+            freeaddrinfo(res);
+            return NGX_OK;
+        }
+    }
+    
+    freeaddrinfo(res);
+    ngx_log_error(NGX_LOG_ERR, log, 0,
+                  "DNS resolution for %V failed: no valid address found", host);
     return NGX_ERROR;
 }
 
@@ -141,8 +192,6 @@ ngx_dynamic_upstream_add_server(ngx_str_t *upstream_name,
     ngx_addr_t                         addr;
     ngx_pool_t                        *pool;
     ngx_slab_pool_t                   *slab;
-    struct sockaddr_in                *sin;
-    struct sockaddr_in6               *sin6;
     ngx_uint_t                         weight, max_fails, max_conns;
     ngx_msec_t                         fail_timeout;
     ngx_uint_t                         socklen;
@@ -190,24 +239,40 @@ ngx_dynamic_upstream_add_server(ngx_str_t *upstream_name,
         return NGX_ERROR;
     }
 
+    /* Initialize addr structure */
+    ngx_memzero(&addr, sizeof(ngx_addr_t));
+
     /* Resolve address */
     if (resolve_address(&host, port, &addr, pool, log) != NGX_OK) {
         ngx_destroy_pool(pool);
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                      "failed to resolve address for %V:%d", &host, port);
+        return NGX_ERROR;
+    }
+
+    /* Verify that address was resolved */
+    if (addr.sockaddr == NULL || addr.socklen == 0) {
+        ngx_destroy_pool(pool);
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                      "address resolution returned invalid result for %V:%d", &host, port);
         return NGX_ERROR;
     }
 
     /* Get peers structure */
+    /* Note: uscf->peer.data should be initialized by Nginx upstream module */
+    /* If it's NULL, upstream has no servers and we cannot add dynamically */
     peers = (ngx_http_upstream_rr_peers_t *) uscf->peer.data;
     if (peers == NULL) {
         ngx_destroy_pool(pool);
         ngx_log_error(NGX_LOG_ERR, log, 0,
-                      "upstream \"%V\" peers not initialized",
+                      "upstream \"%V\" peers not initialized. "
+                      "Upstream must have at least one server in configuration.",
                       upstream_name);
         return NGX_ERROR;
     }
 
-    /* Check if server already exists */
-    ngx_rwlock_wlock(&peers->rwlock);
+    /* Check if server already exists - use read lock first */
+    ngx_rwlock_rlock(&peers->rwlock);
     
     for (peer = peers->peer; peer != NULL; peer = peer->next) {
         if (peer->server.len == server->server.len &&
@@ -221,26 +286,29 @@ ngx_dynamic_upstream_add_server(ngx_str_t *upstream_name,
             return NGX_DECLINED;
         }
     }
+    
+    ngx_rwlock_unlock(&peers->rwlock);
 
-    /* Allocate new peer in shared memory */
+    /* Allocate new peer in shared memory - lock slab mutex for allocation */
     ngx_shmtx_lock(&slab->mutex);
     
-    new_peer = ngx_slab_calloc_locked(slab, sizeof(ngx_http_upstream_rr_peer_t));
+    new_peer = (ngx_http_upstream_rr_peer_t *) ngx_slab_calloc_locked(slab, sizeof(ngx_http_upstream_rr_peer_t));
     if (new_peer == NULL) {
         ngx_shmtx_unlock(&slab->mutex);
-        ngx_rwlock_unlock(&peers->rwlock);
         ngx_destroy_pool(pool);
         ngx_log_error(NGX_LOG_ERR, log, 0,
                       "failed to allocate peer in shared memory");
         return NGX_ERROR;
     }
+    
+    /* Zero-initialize the peer structure */
+    ngx_memzero(new_peer, sizeof(ngx_http_upstream_rr_peer_t));
 
     /* Allocate server string in shared memory */
-    new_peer->server.data = ngx_slab_alloc_locked(slab, server->server.len);
+    new_peer->server.data = (u_char *) ngx_slab_alloc_locked(slab, server->server.len);
     if (new_peer->server.data == NULL) {
         ngx_slab_free_locked(slab, new_peer);
         ngx_shmtx_unlock(&slab->mutex);
-        ngx_rwlock_unlock(&peers->rwlock);
         ngx_destroy_pool(pool);
         ngx_log_error(NGX_LOG_ERR, log, 0,
                       "failed to allocate server string in shared memory");
@@ -255,40 +323,42 @@ ngx_dynamic_upstream_add_server(ngx_str_t *upstream_name,
         ngx_slab_free_locked(slab, new_peer->server.data);
         ngx_slab_free_locked(slab, new_peer);
         ngx_shmtx_unlock(&slab->mutex);
-        ngx_rwlock_unlock(&peers->rwlock);
         ngx_destroy_pool(pool);
         return NGX_ERROR;
     }
     new_peer->name.len = ngx_sock_ntop(addr.sockaddr, addr.socklen, p, NGX_SOCKADDR_STRLEN, 0);
     new_peer->name.data = p;
 
-    /* Copy sockaddr */
+    /* Copy sockaddr - MUST be done before destroying pool! */
     socklen = addr.socklen;
-    new_peer->sockaddr = ngx_slab_alloc_locked(slab, socklen);
+    new_peer->sockaddr = (struct sockaddr *) ngx_slab_alloc_locked(slab, socklen);
     if (new_peer->sockaddr == NULL) {
         ngx_slab_free_locked(slab, new_peer->name.data);
         ngx_slab_free_locked(slab, new_peer->server.data);
         ngx_slab_free_locked(slab, new_peer);
         ngx_shmtx_unlock(&slab->mutex);
-        ngx_rwlock_unlock(&peers->rwlock);
         ngx_destroy_pool(pool);
         return NGX_ERROR;
     }
+    /* Copy sockaddr data BEFORE destroying pool */
     ngx_memcpy(new_peer->sockaddr, addr.sockaddr, socklen);
     new_peer->socklen = socklen;
+    
+    /* Now we can safely destroy pool - all data is copied to shared memory */
 
     /* Set peer parameters */
     weight = (server->weight >= 0) ? server->weight : 1;
-    max_fails = (server->max_fails >= 0) ? server->max_fails : 1;
-    fail_timeout = (server->fail_timeout >= 0) ? server->fail_timeout : 10000;
-    max_conns = (server->max_conns >= 0) ? server->max_conns : 0;
+    max_fails = (server->max_fails >= 0) ? (ngx_uint_t)server->max_fails : 1;
+    fail_timeout = server->fail_timeout > 0 ? server->fail_timeout : 10000;
+    max_conns = (server->max_conns >= 0) ? (ngx_uint_t)server->max_conns : 0;
 
     new_peer->weight = weight;
     new_peer->max_fails = max_fails;
     new_peer->fail_timeout = fail_timeout;
     new_peer->max_conns = max_conns;
     new_peer->down = (server->down > 0) ? 1 : 0;
-    new_peer->backup = (server->backup > 0) ? 1 : 0;
+    /* Note: backup field may not exist in all Nginx versions */
+    /* Setting backup is handled by Nginx upstream configuration */
     new_peer->current_weight = 0;
     new_peer->effective_weight = weight;
     new_peer->fails = 0;
@@ -297,19 +367,38 @@ ngx_dynamic_upstream_add_server(ngx_str_t *upstream_name,
     new_peer->conns = 0;
     new_peer->max_conns = max_conns;
     
-    /* Initialize lock */
-    if (ngx_rwlock_init(&new_peer->lock) != NGX_OK) {
-        ngx_slab_free_locked(slab, new_peer->sockaddr);
-        ngx_slab_free_locked(slab, new_peer->name.data);
-        ngx_slab_free_locked(slab, new_peer->server.data);
-        ngx_slab_free_locked(slab, new_peer);
-        ngx_shmtx_unlock(&slab->mutex);
-        ngx_rwlock_unlock(&peers->rwlock);
-        ngx_destroy_pool(pool);
-        return NGX_ERROR;
-    }
+    /* Initialize lock - rwlock is already initialized in shared memory */
+    /* Note: ngx_rwlock_init is a macro that may not be available in all Nginx versions */
+    /* The lock structure is zero-initialized by ngx_slab_calloc_locked */
 
     new_peer->next = NULL;
+
+    /* Unlock slab mutex before acquiring write lock on peers */
+    ngx_shmtx_unlock(&slab->mutex);
+    
+    /* Now lock peers for writing to add to list */
+    ngx_rwlock_wlock(&peers->rwlock);
+    
+    /* Double-check that server doesn't exist (another worker might have added it) */
+    for (peer = peers->peer; peer != NULL; peer = peer->next) {
+        if (peer->server.len == server->server.len &&
+            ngx_memcmp(peer->server.data, server->server.data,
+                      server->server.len) == 0) {
+            ngx_rwlock_unlock(&peers->rwlock);
+            /* Free allocated peer from shared memory */
+            ngx_shmtx_lock(&slab->mutex);
+            if (new_peer->sockaddr) ngx_slab_free_locked(slab, new_peer->sockaddr);
+            if (new_peer->name.data) ngx_slab_free_locked(slab, new_peer->name.data);
+            if (new_peer->server.data) ngx_slab_free_locked(slab, new_peer->server.data);
+            ngx_slab_free_locked(slab, new_peer);
+            ngx_shmtx_unlock(&slab->mutex);
+            ngx_destroy_pool(pool);
+            ngx_log_error(NGX_LOG_WARN, log, 0,
+                          "server %V already exists in upstream %V (race condition)",
+                          &server->server, upstream_name);
+            return NGX_DECLINED;
+        }
+    }
 
     /* Add to list */
     if (peers->peer == NULL) {
@@ -324,12 +413,11 @@ ngx_dynamic_upstream_add_server(ngx_str_t *upstream_name,
 
     /* Update counters */
     peers->number++;
-    if (!new_peer->down && !new_peer->backup) {
+    if (!new_peer->down) {
         peers->tries++;
     }
     peers->total_weight += weight;
 
-    ngx_shmtx_unlock(&slab->mutex);
     ngx_rwlock_unlock(&peers->rwlock);
     ngx_destroy_pool(pool);
 
@@ -366,9 +454,9 @@ ngx_dynamic_upstream_add_server(ngx_str_t *upstream_name,
 
     ngx_log_error(NGX_LOG_NOTICE, log, 0,
                   "added server %V to upstream %V (weight=%ui, max_fails=%ui, "
-                  "fail_timeout=%T, max_conns=%ui, backup=%d, down=%d)",
+                  "fail_timeout=%T, max_conns=%ui, down=%d)",
                   &server->server, upstream_name, weight, max_fails,
-                  fail_timeout, max_conns, new_peer->backup, new_peer->down);
+                  fail_timeout, max_conns, new_peer->down);
 
     /* Save peers to file if configured */
     ngx_dynamic_upstream_save_peers(upstream_name, log);
@@ -483,8 +571,8 @@ ngx_dynamic_upstream_update_server(ngx_str_t *upstream_name,
             if (server->max_fails >= 0) {
                 peer->max_fails = server->max_fails;
             }
-            if (server->fail_timeout >= 0) {
-                peer->fail_timeout = server->fail_timeout;
+            if (server->fail_timeout > 0) {
+                peer->fail_timeout = (ngx_msec_t)server->fail_timeout;
             }
             if (server->max_conns >= 0) {
                 peer->max_conns = server->max_conns;
@@ -525,7 +613,6 @@ ngx_dynamic_upstream_list_servers(ngx_str_t *upstream_name,
     ngx_http_upstream_rr_peers_t  *peers;
     ngx_http_upstream_rr_peer_t   *peer;
     u_char                        *p;
-    ngx_uint_t                     i;
 
     if (upstream_name == NULL || output == NULL || pool == NULL || log == NULL) {
         return NGX_ERROR;
@@ -579,7 +666,7 @@ ngx_dynamic_upstream_list_servers(ngx_str_t *upstream_name,
             p = ngx_snprintf(p, output->data + buf_size - p, " down");
         }
 
-        p = ngx_snprintf(p, output->data + buf_size - p, ";" LF);
+        p = ngx_snprintf(p, output->data + buf_size - p, ";\n");
     }
 
     ngx_rwlock_unlock(&peers->rwlock);
@@ -662,8 +749,11 @@ ngx_dynamic_upstream_save_peers(ngx_str_t *upstream_name, ngx_log_t *log)
     }
 
     /* Create directory if needed */
-    u_char *dir_end = (u_char *) ngx_strrchr(path_data, '/');
-    if (dir_end != NULL) {
+    u_char *dir_end = path_data + path_size - 1;
+    while (dir_end > path_data && *dir_end != '/') {
+        dir_end--;
+    }
+    if (dir_end > path_data && *dir_end == '/') {
         *dir_end = '\0';
         if (ngx_file_info(path_data, &fi) == NGX_FILE_ERROR) {
             if (ngx_create_full_path(path_data, ngx_dir_access(NGX_FILE_OWNER_ACCESS))
@@ -700,20 +790,18 @@ ngx_dynamic_upstream_save_peers(ngx_str_t *upstream_name, ngx_log_t *log)
         fprintf(f, "server %.*s", (int)peer->server.len, peer->server.data);
         
         if (peer->weight != 1) {
-            fprintf(f, " weight=%ui", peer->weight);
+            fprintf(f, " weight=%u", (unsigned int)peer->weight);
         }
         if (peer->max_fails != 1) {
-            fprintf(f, " max_fails=%ui", peer->max_fails);
+            fprintf(f, " max_fails=%u", (unsigned int)peer->max_fails);
         }
         if (peer->fail_timeout != 10000) {
-            fprintf(f, " fail_timeout=%T", peer->fail_timeout);
+            fprintf(f, " fail_timeout=%lu", (unsigned long)peer->fail_timeout);
         }
         if (peer->max_conns != 0) {
-            fprintf(f, " max_conns=%ui", peer->max_conns);
+            fprintf(f, " max_conns=%u", (unsigned int)peer->max_conns);
         }
-        if (peer->backup) {
-            fprintf(f, " backup");
-        }
+        /* Note: backup field may not exist in all Nginx versions */
         if (peer->down) {
             fprintf(f, " down");
         }
