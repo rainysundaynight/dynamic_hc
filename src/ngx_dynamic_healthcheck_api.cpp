@@ -891,6 +891,9 @@ healthcheck_open(ngx_dynamic_healthcheck_conf_t *conf,
     FILE                            *f = NULL;
     ngx_core_conf_t                 *ccf;
     ngx_log_t                       *log = pool->log;
+    ngx_file_info_t                  fi;
+    static time_t                    last_error_log = 0;
+    time_t                           now;
 
     ccf = (ngx_core_conf_t *) ngx_get_conf(ngx_cycle->conf_ctx,
                                            ngx_core_module);
@@ -917,11 +920,25 @@ healthcheck_open(ngx_dynamic_healthcheck_conf_t *conf,
     if (path.len == 10240)
         goto nomem;
 
-    if (ngx_create_full_path(path.data, ngx_dir_access(NGX_FILE_OWNER_ACCESS))
-            != NGX_OK) {
-        ngx_log_error(NGX_LOG_CRIT, log, 0, "can't create directory: %V",
-                      &dir);
-        return NULL;
+    /* Try to create directory path, but check if it already exists first */
+    if (ngx_file_info(dir.data, &fi) == NGX_FILE_ERROR) {
+        /* Directory doesn't exist, try to create it */
+        if (ngx_create_full_path(path.data, ngx_dir_access(NGX_FILE_OWNER_ACCESS))
+                != NGX_OK) {
+            /* Check again if directory was created by another worker */
+            if (ngx_file_info(dir.data, &fi) == NGX_FILE_ERROR) {
+                /* Only log error once per minute to avoid spam */
+                now = ngx_time();
+                if (now - last_error_log >= 60) {
+                    ngx_log_error(NGX_LOG_WARN, log, 0,
+                                  "can't create directory: %V (persistent storage disabled)",
+                                  &dir);
+                    last_error_log = now;
+                }
+                return NULL;
+            }
+            /* Directory was created by another worker, continue */
+        }
     }
 
     f = fopen((const char *) path.data, mode);

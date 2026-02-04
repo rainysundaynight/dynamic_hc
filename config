@@ -13,6 +13,7 @@ HTTP_DYNAMIC_HC_SRCS="                                    \
     $ngx_addon_dir/src/ngx_http_dynamic_healthcheck.cpp   \
     $ngx_addon_dir/src/ngx_stream_dynamic_healthcheck.cpp \
     $ngx_addon_dir/src/ngx_dynamic_shm.c                  \
+    $ngx_addon_dir/src/ngx_dynamic_upstream.cpp           \
 "
 
 HTTP_DYNAMIC_HC_DEPS="                                      \
@@ -24,7 +25,8 @@ HTTP_DYNAMIC_HC_DEPS="                                      \
     $ngx_addon_dir/src/ngx_dynamic_healthcheck_https.h       \
     $ngx_addon_dir/src/ngx_dynamic_healthcheck_api.h        \
     $ngx_addon_dir/src/ngx_dynamic_healthcheck_config.h     \
-    $ngx_addon_dir/src/ngx_dynamic_shm.h                    \
+    $ngx_addon_dir/src/ngx_dynamic_shm.h                     \
+    $ngx_addon_dir/src/ngx_dynamic_upstream.h               \
 "
 
 if test -n "$ngx_module_link"; then

@@ -87,6 +87,7 @@ struct ngx_dynamic_healthcheck_opts_s {
     size_t                   buffer_size;
     ngx_msec_t               last;
     ngx_str_t                persistent;
+    ngx_str_t                upstream_state_file;  /* File to store upstream peers */
     ngx_uint_t               updated;
     ngx_int_t                loaded;
     ngx_flag_t               passive;

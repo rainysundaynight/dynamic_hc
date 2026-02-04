@@ -66,6 +66,13 @@ static ngx_command_t ngx_stream_dynamic_healthcheck_commands[] = {
       offsetof(ngx_dynamic_healthcheck_opts_t, persistent),
       NULL },
 
+    { ngx_string("dynamic_upstream_state_file"),
+      NGX_STREAM_UPS_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_dynamic_healthcheck_opts_t, upstream_state_file),
+      NULL },
+
     { ngx_string("check"),
       NGX_STREAM_UPS_CONF|NGX_CONF_ANY,
       ngx_dynamic_healthcheck_check,
@@ -350,6 +357,8 @@ ngx_stream_dynamic_healthcheck_init_srv_conf(ngx_conf_t *cf,
         main_conf->config.disabled_hosts);
     ngx_conf_merge_str_value(conf->config.persistent,
         main_conf->config.persistent);
+    ngx_conf_merge_str_value(conf->config.upstream_state_file,
+        main_conf->config.upstream_state_file);
 
     if (conf->config.type.data != NULL
         && ngx_strncmp(conf->config.type.data, "http", 4) == 0)

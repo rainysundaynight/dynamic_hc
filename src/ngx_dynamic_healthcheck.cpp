@@ -14,6 +14,7 @@ extern "C" {
 #include "ngx_dynamic_healthcheck_http.h"
 #include "ngx_dynamic_healthcheck_ssl.h"
 #include "ngx_dynamic_healthcheck_https.h"
+#include "ngx_dynamic_upstream.h"
 
 
 static void
@@ -34,8 +35,37 @@ ngx_dynamic_healthcheck_refresh_timers(ngx_event_t *ev)
 ngx_int_t
 ngx_dynamic_healthcheck_init_worker(ngx_cycle_t *cycle)
 {
+    ngx_uint_t                      i;
+    ngx_http_upstream_main_conf_t  *umcf;
+    ngx_http_upstream_srv_conf_t  **uscfp;
+    ngx_dynamic_healthcheck_conf_t *conf;
+
     if (ngx_process != NGX_PROCESS_WORKER && ngx_process != NGX_PROCESS_SINGLE)
         return NGX_OK;
+
+    /* Load peers from file for all HTTP upstreams */
+    umcf = (ngx_http_upstream_main_conf_t *)
+        ngx_http_cycle_get_module_main_conf(ngx_cycle, ngx_http_upstream_module);
+    
+    if (umcf != NULL && umcf->upstreams.nelts > 0) {
+        extern ngx_module_t ngx_http_x5digital_dynamic_hc_module;
+        
+        uscfp = (ngx_http_upstream_srv_conf_t **) umcf->upstreams.elts;
+        
+        for (i = 0; i < umcf->upstreams.nelts; i++) {
+            if (uscfp[i]->srv_conf == NULL)
+                continue;
+            
+            conf = (ngx_dynamic_healthcheck_conf_t *)
+                ngx_http_conf_upstream_srv_conf(uscfp[i],
+                    ngx_http_x5digital_dynamic_hc_module);
+            
+            if (conf != NULL && conf->config.upstream_state_file.len > 0) {
+                /* Load peers from file */
+                ngx_dynamic_upstream_load_peers(&uscfp[i]->host, cycle->log);
+            }
+        }
+    }
 
     ngx_event_t *event = (ngx_event_t *) ngx_pcalloc(cycle->pool,
         sizeof(ngx_event_t));

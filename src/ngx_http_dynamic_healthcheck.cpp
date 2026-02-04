@@ -15,6 +15,7 @@ extern "C" {
 #include "ngx_dynamic_healthcheck_config.h"
 #include "ngx_dynamic_healthcheck_api.h"
 #include "ngx_dynamic_healthcheck_state.h"
+#include "ngx_dynamic_upstream.h"
 
 extern "C" {
 #include <openssl/ssl.h>
@@ -101,6 +102,13 @@ static ngx_command_t ngx_http_dynamic_healthcheck_commands[] = {
       offsetof(ngx_dynamic_healthcheck_opts_t, persistent),
       NULL },
 
+    { ngx_string("dynamic_upstream_state_file"),
+      NGX_HTTP_UPS_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_SRV_CONF_OFFSET,
+      offsetof(ngx_dynamic_healthcheck_opts_t, upstream_state_file),
+      NULL },
+
     { ngx_string("check"),
       NGX_HTTP_UPS_CONF|NGX_CONF_ANY,
       ngx_dynamic_healthcheck_check,
@@ -181,6 +189,13 @@ static ngx_command_t ngx_http_dynamic_healthcheck_commands[] = {
     { ngx_string("healthcheck_status"),
       NGX_HTTP_LOC_CONF|NGX_CONF_NOARGS,
       ngx_http_dynamic_healthcheck_status,
+      0,
+      0,
+      NULL },
+
+    { ngx_string("dynamic_upstream"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_NOARGS,
+      ngx_http_dynamic_upstream_handler,
       0,
       0,
       NULL },
@@ -472,6 +487,8 @@ ngx_http_dynamic_healthcheck_init_srv_conf(ngx_conf_t *cf,
         main_conf->config.disabled_hosts);
     ngx_conf_merge_str_value(conf->config.persistent,
         main_conf->config.persistent);
+    ngx_conf_merge_str_value(conf->config.upstream_state_file,
+        main_conf->config.upstream_state_file);
 
     if (conf->config.type.data != NULL
         && (ngx_strncmp(conf->config.type.data, "http", 4) == 0
@@ -1532,6 +1549,542 @@ ngx_http_dynamic_healthcheck_status(ngx_conf_t *cf,
     clcf = (ngx_http_core_loc_conf_t *) ngx_http_conf_get_module_loc_conf(cf,
         ngx_http_core_module);
     clcf->handler = ngx_http_dynamic_healthcheck_status_handler;
+
+    return NGX_CONF_OK;
+}
+
+
+static ngx_int_t
+ngx_http_dynamic_upstream_handler_func(ngx_http_request_t *r);
+
+
+/* Simple JSON parser helper - extract value from JSON string */
+static ngx_int_t
+parse_json_value(ngx_str_t *json, const char *key, ngx_str_t *value)
+{
+    u_char  *p, *start, *end;
+    size_t   key_len = ngx_strlen(key);
+    ngx_str_t key_str = { key_len, (u_char *) key };
+
+    p = json->data;
+    end = json->data + json->len;
+
+    /* Find key */
+    while (p < end) {
+        if (*p == '"' && p + 1 < end) {
+            start = p + 1;
+            p++;
+            while (p < end && *p != '"') p++;
+            if (p < end && ngx_memcmp(start, key_str.data, key_len) == 0 &&
+                p - start == key_len) {
+                /* Found key, skip to value */
+                p++;
+                while (p < end && (*p == ' ' || *p == ':' || *p == '\t')) p++;
+                if (p >= end) return NGX_ERROR;
+                
+                /* Extract value */
+                if (*p == '"') {
+                    /* String value */
+                    start = p + 1;
+                    p++;
+                    while (p < end && *p != '"') p++;
+                    if (p >= end) return NGX_ERROR;
+                    value->data = start;
+                    value->len = p - start;
+                    return NGX_OK;
+                } else if (*p >= '0' && *p <= '9') {
+                    /* Number value */
+                    start = p;
+                    while (p < end && (*p >= '0' && *p <= '9')) p++;
+                    value->data = start;
+                    value->len = p - start;
+                    return NGX_OK;
+                } else if (*p == 't' && p + 4 <= end && 
+                          ngx_memcmp(p, "true", 4) == 0) {
+                    /* Boolean true */
+                    value->data = p;
+                    value->len = 4;
+                    return NGX_OK;
+                } else if (*p == 'f' && p + 5 <= end && 
+                          ngx_memcmp(p, "false", 5) == 0) {
+                    /* Boolean false */
+                    value->data = p;
+                    value->len = 5;
+                    return NGX_OK;
+                }
+            }
+        }
+        p++;
+    }
+    
+    return NGX_DECLINED;
+}
+
+/* Parse JSON request body */
+static ngx_int_t
+parse_json_request(ngx_http_request_t *r, ngx_dynamic_upstream_server_t *server_params,
+                   ngx_str_t *upstream_name, ngx_str_t *action)
+{
+    ngx_str_t                      body;
+    ngx_str_t                      value;
+    u_char                        *p;
+
+    if (r->request_body == NULL || r->request_body->bufs == NULL) {
+        return NGX_DECLINED;
+    }
+
+    /* Read request body */
+    body.len = r->headers_in.content_length_n;
+    if (body.len == 0 || body.len > 4096) {
+        return NGX_DECLINED;
+    }
+
+    body.data = ngx_pcalloc(r->pool, body.len + 1);
+    if (body.data == NULL) {
+        return NGX_ERROR;
+    }
+
+    p = body.data;
+    ngx_chain_t *cl = r->request_body->bufs;
+    while (cl != NULL && cl->buf != NULL) {
+        ngx_memcpy(p, cl->buf->pos, cl->buf->last - cl->buf->pos);
+        p += cl->buf->last - cl->buf->pos;
+        cl = cl->next;
+    }
+    body.len = p - body.data;
+    body.data[body.len] = '\0';
+
+    /* Parse JSON */
+    if (parse_json_value(&body, "upstream", upstream_name) == NGX_OK) {
+        /* OK */
+    }
+
+    if (parse_json_value(&body, "action", action) == NGX_OK) {
+        /* OK */
+    }
+
+    if (parse_json_value(&body, "server", &value) == NGX_OK) {
+        server_params->server = value;
+    }
+
+    if (parse_json_value(&body, "weight", &value) == NGX_OK) {
+        server_params->weight = ngx_atoi(value.data, value.len);
+    } else {
+        server_params->weight = -1;
+    }
+
+    if (parse_json_value(&body, "max_fails", &value) == NGX_OK) {
+        server_params->max_fails = ngx_atoi(value.data, value.len);
+    } else {
+        server_params->max_fails = -1;
+    }
+
+    if (parse_json_value(&body, "fail_timeout", &value) == NGX_OK) {
+        server_params->fail_timeout = ngx_atoi(value.data, value.len);
+    } else {
+        server_params->fail_timeout = -1;
+    }
+
+    if (parse_json_value(&body, "max_conns", &value) == NGX_OK) {
+        server_params->max_conns = ngx_atoi(value.data, value.len);
+    } else {
+        server_params->max_conns = -1;
+    }
+
+    if (parse_json_value(&body, "backup", &value) == NGX_OK) {
+        server_params->backup = (value.len == 4 && ngx_memcmp(value.data, "true", 4) == 0) ? 1 : -1;
+    } else {
+        server_params->backup = -1;
+    }
+
+    if (parse_json_value(&body, "down", &value) == NGX_OK) {
+        server_params->down = (value.len == 4 && ngx_memcmp(value.data, "true", 4) == 0) ? 1 : 0;
+    } else {
+        server_params->down = -1;
+    }
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_dynamic_upstream_handler_impl(ngx_http_request_t *r)
+{
+    ngx_http_variable_value_t      *upstream;
+    ngx_http_variable_value_t      *server;
+    ngx_http_variable_value_t      *add;
+    ngx_http_variable_value_t      *remove;
+    ngx_http_variable_value_t      *weight;
+    ngx_http_variable_value_t      *max_fails;
+    ngx_http_variable_value_t      *fail_timeout;
+    ngx_http_variable_value_t      *max_conns;
+    ngx_http_variable_value_t      *backup;
+    ngx_http_variable_value_t      *down;
+    ngx_http_variable_value_t      *up;
+    ngx_dynamic_upstream_server_t  server_params;
+    ngx_str_t                      upstream_name;
+    ngx_str_t                      output;
+    ngx_str_t                      action = ngx_null_string;
+    ngx_int_t                       rc;
+    ngx_chain_t                    *out;
+    static ngx_str_t                json_type = ngx_string("application/json");
+    static ngx_str_t                text = ngx_string("text/plain");
+    ngx_flag_t                      use_json = 0;
+
+    if (r->method != NGX_HTTP_GET && r->method != NGX_HTTP_POST && r->method != NGX_HTTP_PUT && r->method != NGX_HTTP_DELETE) {
+        return NGX_HTTP_NOT_ALLOWED;
+    }
+
+    ngx_memzero(&server_params, sizeof(ngx_dynamic_upstream_server_t));
+
+    /* Try to parse JSON body first for POST/PUT/DELETE requests */
+    if (r->method == NGX_HTTP_POST || r->method == NGX_HTTP_PUT || r->method == NGX_HTTP_DELETE) {
+        if (r->headers_in.content_type != NULL &&
+            r->headers_in.content_type->value.len >= 16 &&
+            ngx_memcmp(r->headers_in.content_type->value.data, "application/json", 16) == 0) {
+            /* Read request body */
+            if (r->request_body == NULL) {
+                rc = ngx_http_read_client_request_body(r, NULL);
+                if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+                    return rc;
+                }
+            }
+            
+            if (r->request_body != NULL && r->request_body->bufs != NULL) {
+                if (parse_json_request(r, &server_params, &upstream_name, &action) == NGX_OK) {
+                    use_json = 1;
+                    /* Set default action based on HTTP method if not specified in JSON */
+                    if (action.len == 0) {
+                        if (r->method == NGX_HTTP_DELETE) {
+                            action.data = (u_char *) "remove";
+                            action.len = 6;
+                        } else if (r->method == NGX_HTTP_PUT) {
+                            action.data = (u_char *) "update";
+                            action.len = 6;
+                        } else if (r->method == NGX_HTTP_POST) {
+                            action.data = (u_char *) "add";
+                            action.len = 3;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* Fallback to query parameters if JSON not used */
+    if (!use_json) {
+        if ((rc = ngx_http_discard_request_body(r)) != NGX_OK) {
+            return rc;
+        }
+
+    upstream = get_arg(r, "arg_upstream");
+    server = get_arg(r, "arg_server");
+    add = get_arg(r, "arg_add");
+    remove = get_arg(r, "arg_remove");
+    weight = get_arg(r, "arg_weight");
+    max_fails = get_arg(r, "arg_max_fails");
+    fail_timeout = get_arg(r, "arg_fail_timeout");
+    max_conns = get_arg(r, "arg_max_conns");
+    backup = get_arg(r, "arg_backup");
+    down = get_arg(r, "arg_down");
+    up = get_arg(r, "arg_up");
+
+    if (upstream->not_found) {
+        r->headers_out.status = NGX_HTTP_BAD_REQUEST;
+        return NGX_HTTP_BAD_REQUEST;
+    }
+
+    upstream_name.data = upstream->data;
+    upstream_name.len = upstream->len;
+
+    ngx_memzero(&server_params, sizeof(ngx_dynamic_upstream_server_t));
+
+    /* Parse server parameters */
+    if (!server->not_found) {
+        server_params.server.data = server->data;
+        server_params.server.len = server->len;
+    }
+
+    if (!weight->not_found) {
+        server_params.weight = ngx_atoi(weight->data, weight->len);
+    } else {
+        server_params.weight = -1; /* Don't update */
+    }
+
+    if (!max_fails->not_found) {
+        server_params.max_fails = ngx_atoi(max_fails->data, max_fails->len);
+    } else {
+        server_params.max_fails = -1;
+    }
+
+    if (!fail_timeout->not_found) {
+        server_params.fail_timeout = ngx_atoi(fail_timeout->data, fail_timeout->len);
+    } else {
+        server_params.fail_timeout = -1;
+    }
+
+    if (!max_conns->not_found) {
+        server_params.max_conns = ngx_atoi(max_conns->data, max_conns->len);
+    } else {
+        server_params.max_conns = -1;
+    }
+
+    server_params.backup = backup->not_found ? -1 : 1;
+    server_params.down = down->not_found ? (up->not_found ? -1 : 0) : 1;
+
+    /* Handle different operations - use action from JSON or determine from query params */
+    if (use_json && action.len > 0) {
+        /* Use action from JSON */
+        if (action.len == 3 && ngx_memcmp(action.data, "add", 3) == 0) {
+            /* Add server */
+            if (server_params.server.len == 0) {
+                r->headers_out.status = NGX_HTTP_BAD_REQUEST;
+                if (use_json) {
+                    r->headers_out.content_type = json_type;
+                    out = ngx_alloc_chain_link(r->pool);
+                    if (out == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                    out->buf = ngx_create_temp_buf(r->pool, 100);
+                    if (out->buf == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                    out->buf->last = ngx_snprintf(out->buf->last, out->buf->end - out->buf->last,
+                                                 "{\"error\":\"server parameter required\"}");
+                    out->buf->last_buf = 1;
+                    out->next = NULL;
+                    r->headers_out.content_length_n = out->buf->last - out->buf->start;
+                    ngx_http_send_header(r);
+                    return ngx_http_output_filter(r, out);
+                }
+                return NGX_HTTP_BAD_REQUEST;
+            }
+            rc = ngx_dynamic_upstream_add_server(&upstream_name, &server_params, r->connection->log);
+        } else if (action.len == 6 && ngx_memcmp(action.data, "remove", 6) == 0) {
+            /* Remove server */
+            if (server_params.server.len == 0) {
+                r->headers_out.status = NGX_HTTP_BAD_REQUEST;
+                if (use_json) {
+                    r->headers_out.content_type = json_type;
+                    out = ngx_alloc_chain_link(r->pool);
+                    if (out == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                    out->buf = ngx_create_temp_buf(r->pool, 100);
+                    if (out->buf == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                    out->buf->last = ngx_snprintf(out->buf->last, out->buf->end - out->buf->last,
+                                                 "{\"error\":\"server parameter required\"}");
+                    out->buf->last_buf = 1;
+                    out->next = NULL;
+                    r->headers_out.content_length_n = out->buf->last - out->buf->start;
+                    ngx_http_send_header(r);
+                    return ngx_http_output_filter(r, out);
+                }
+                return NGX_HTTP_BAD_REQUEST;
+            }
+            ngx_str_t server_addr = { server_params.server.len, server_params.server.data };
+            rc = ngx_dynamic_upstream_remove_server(&upstream_name, &server_addr, r->connection->log);
+        } else if (action.len == 6 && ngx_memcmp(action.data, "update", 6) == 0) {
+            /* Update server */
+            if (server_params.server.len == 0) {
+                r->headers_out.status = NGX_HTTP_BAD_REQUEST;
+                if (use_json) {
+                    r->headers_out.content_type = json_type;
+                    out = ngx_alloc_chain_link(r->pool);
+                    if (out == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                    out->buf = ngx_create_temp_buf(r->pool, 100);
+                    if (out->buf == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                    out->buf->last = ngx_snprintf(out->buf->last, out->buf->end - out->buf->last,
+                                                 "{\"error\":\"server parameter required\"}");
+                    out->buf->last_buf = 1;
+                    out->next = NULL;
+                    r->headers_out.content_length_n = out->buf->last - out->buf->start;
+                    ngx_http_send_header(r);
+                    return ngx_http_output_filter(r, out);
+                }
+                return NGX_HTTP_BAD_REQUEST;
+            }
+            ngx_str_t server_addr = { server_params.server.len, server_params.server.data };
+            rc = ngx_dynamic_upstream_update_server(&upstream_name, &server_addr, &server_params, r->connection->log);
+        } else {
+            /* Unknown action */
+            r->headers_out.status = NGX_HTTP_BAD_REQUEST;
+            if (use_json) {
+                r->headers_out.content_type = json_type;
+                out = ngx_alloc_chain_link(r->pool);
+                if (out == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                out->buf = ngx_create_temp_buf(r->pool, 100);
+                if (out->buf == NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
+                out->buf->last = ngx_snprintf(out->buf->last, out->buf->end - out->buf->last,
+                                             "{\"error\":\"unknown action\"}");
+                out->buf->last_buf = 1;
+                out->next = NULL;
+                r->headers_out.content_length_n = out->buf->last - out->buf->start;
+                ngx_http_send_header(r);
+                return ngx_http_output_filter(r, out);
+            }
+            return NGX_HTTP_BAD_REQUEST;
+        }
+    } else if (!use_json) {
+        /* Handle query parameters */
+        if (!add->not_found) {
+            /* Add server */
+            rc = ngx_dynamic_upstream_add_server(&upstream_name, &server_params, r->connection->log);
+        } else if (!remove->not_found || r->method == NGX_HTTP_DELETE) {
+            /* Remove server */
+            if (server->not_found) {
+                r->headers_out.status = NGX_HTTP_BAD_REQUEST;
+                return NGX_HTTP_BAD_REQUEST;
+            }
+            ngx_str_t server_addr = { server->len, server->data };
+            rc = ngx_dynamic_upstream_remove_server(&upstream_name, &server_addr, r->connection->log);
+        } else if (!server->not_found && 
+                   (!weight->not_found || !max_fails->not_found || 
+                    !fail_timeout->not_found || !max_conns->not_found ||
+                    !backup->not_found || !down->not_found || !up->not_found)) {
+            /* Update server */
+            ngx_str_t server_addr = { server->len, server->data };
+            rc = ngx_dynamic_upstream_update_server(&upstream_name, &server_addr, &server_params, r->connection->log);
+        } else {
+        /* List servers */
+        rc = ngx_dynamic_upstream_list_servers(&upstream_name, &output, r->pool, r->connection->log);
+        if (rc == NGX_OK) {
+            out = ngx_alloc_chain_link(r->pool);
+            if (out == NULL) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            out->buf = ngx_create_temp_buf(r->pool, output.len);
+            if (out->buf == NULL) {
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            ngx_memcpy(out->buf->last, output.data, output.len);
+            out->buf->last += output.len;
+            out->buf->last_buf = 1;
+            out->buf->last_in_chain = 1;
+            out->next = NULL;
+
+            r->headers_out.status = NGX_HTTP_OK;
+            r->headers_out.content_type = use_json ? json_type : text;
+            r->headers_out.content_length_n = output.len;
+
+            rc = ngx_http_send_header(r);
+            if (rc == NGX_ERROR || rc > NGX_OK) {
+                return rc;
+            }
+
+            return ngx_http_output_filter(r, out);
+        }
+    }
+
+    /* Prepare response */
+    out = ngx_alloc_chain_link(r->pool);
+    if (out == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    out->buf = ngx_create_temp_buf(r->pool, ngx_pagesize);
+    if (out->buf == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    out->next = NULL;
+    out->buf->last_buf = 1;
+    out->buf->last_in_chain = 1;
+
+    if (use_json) {
+        r->headers_out.content_type = json_type;
+    } else {
+        r->headers_out.content_type = text;
+    }
+
+    switch (rc) {
+        case NGX_OK:
+            r->headers_out.status = NGX_HTTP_OK;
+            if (use_json) {
+                out->buf->last = ngx_snprintf(out->buf->last,
+                                             out->buf->end - out->buf->last,
+                                             "{\"status\":\"ok\",\"message\":\"operation successful\"}");
+            } else {
+                out->buf->last = ngx_snprintf(out->buf->last,
+                                             out->buf->end - out->buf->last,
+                                             "ok");
+            }
+            break;
+
+        case NGX_DECLINED:
+            r->headers_out.status = NGX_HTTP_NOT_MODIFIED;
+            if (use_json) {
+                out->buf->last = ngx_snprintf(out->buf->last,
+                                             out->buf->end - out->buf->last,
+                                             "{\"status\":\"not_modified\",\"message\":\"no changes\"}");
+            } else {
+                r->header_only = 1;
+            }
+            break;
+
+        case NGX_AGAIN:
+            r->headers_out.status = NGX_HTTP_BAD_REQUEST;
+            if (use_json) {
+                out->buf->last = ngx_snprintf(out->buf->last,
+                                             out->buf->end - out->buf->last,
+                                             "{\"status\":\"error\",\"message\":\"bad request\"}");
+            } else {
+                out->buf->last = ngx_snprintf(out->buf->last,
+                                             out->buf->end - out->buf->last,
+                                             "bad request");
+            }
+            break;
+
+        case NGX_ERROR:
+        default:
+            r->headers_out.status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+            if (use_json) {
+                out->buf->last = ngx_snprintf(out->buf->last,
+                                             out->buf->end - out->buf->last,
+                                             "{\"status\":\"error\",\"message\":\"internal error\"}");
+            } else {
+                out->buf->last = ngx_snprintf(out->buf->last,
+                                             out->buf->end - out->buf->last,
+                                             "internal error");
+            }
+            break;
+    }
+
+    if (!r->header_only) {
+        r->headers_out.content_length_n = out->buf->last - out->buf->start;
+    }
+
+    rc = ngx_http_send_header(r);
+    if (rc == NGX_ERROR || rc > NGX_OK) {
+        return rc;
+    }
+
+    if (r->header_only) {
+        return NGX_OK;
+    }
+
+    return ngx_http_output_filter(r, out);
+}
+
+
+static ngx_int_t
+ngx_http_dynamic_upstream_handler_func(ngx_http_request_t *r)
+{
+    return ngx_http_dynamic_upstream_handler_impl(r);
+}
+
+
+static ngx_int_t
+ngx_http_dynamic_upstream_handler_wrapper(ngx_http_request_t *r)
+{
+    return ngx_http_dynamic_upstream_handler_func(r);
+}
+
+
+static char *
+ngx_http_dynamic_upstream_handler(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf)
+{
+    ngx_http_core_loc_conf_t  *clcf;
+
+    clcf = (ngx_http_core_loc_conf_t *) ngx_http_conf_get_module_loc_conf(cf,
+        ngx_http_core_module);
+    clcf->handler = ngx_http_dynamic_upstream_handler_wrapper;
 
     return NGX_CONF_OK;
 }
