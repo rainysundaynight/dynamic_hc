@@ -349,7 +349,16 @@ ngx_dynamic_upstream_add_server(ngx_str_t *upstream_name,
     /* Set peer parameters */
     weight = (server->weight >= 0) ? server->weight : 1;
     max_fails = (server->max_fails >= 0) ? (ngx_uint_t)server->max_fails : 1;
-    fail_timeout = server->fail_timeout > 0 ? server->fail_timeout : 10000;
+    /* fail_timeout: -1 means use default from upstream config, >0 means set value */
+    if (server->fail_timeout == -1) {
+        /* Use default fail_timeout from upstream configuration */
+        fail_timeout = peers->fail_timeout > 0 ? peers->fail_timeout : 10000;
+    } else if (server->fail_timeout > 0) {
+        fail_timeout = server->fail_timeout;
+    } else {
+        /* Default value if not specified */
+        fail_timeout = 10000;
+    }
     max_conns = (server->max_conns >= 0) ? (ngx_uint_t)server->max_conns : 0;
 
     new_peer->weight = weight;
@@ -571,7 +580,11 @@ ngx_dynamic_upstream_update_server(ngx_str_t *upstream_name,
             if (server->max_fails >= 0) {
                 peer->max_fails = server->max_fails;
             }
-            if (server->fail_timeout > 0) {
+            /* fail_timeout: -1 means use default from upstream config, >0 means set value */
+            if (server->fail_timeout == -1) {
+                /* Use default fail_timeout from upstream configuration */
+                peer->fail_timeout = peers->fail_timeout > 0 ? peers->fail_timeout : 10000;
+            } else if (server->fail_timeout > 0) {
                 peer->fail_timeout = (ngx_msec_t)server->fail_timeout;
             }
             if (server->max_conns >= 0) {
@@ -756,20 +769,28 @@ ngx_dynamic_upstream_save_peers(ngx_str_t *upstream_name, ngx_log_t *log)
     if (dir_end > path_data && *dir_end == '/') {
         *dir_end = '\0';
         if (ngx_file_info(path_data, &fi) == NGX_FILE_ERROR) {
+            ngx_log_error(NGX_LOG_DEBUG, log, 0,
+                          "creating directory for peers file: %s", path_data);
             if (ngx_create_full_path(path_data, ngx_dir_access(NGX_FILE_OWNER_ACCESS))
                     != NGX_OK) {
                 /* Check again if directory was created by another worker */
                 if (ngx_file_info(path_data, &fi) == NGX_FILE_ERROR) {
                     now = ngx_time();
                     if (now - last_error_log >= 60) {
-                        ngx_log_error(NGX_LOG_WARN, log, 0,
-                                      "can't create directory for peers file: %s",
-                                      path_data);
+                        ngx_log_error(NGX_LOG_ERR, log, errno,
+                                      "can't create directory for peers file: %s (errno: %d)",
+                                      path_data, errno);
                         last_error_log = now;
                     }
                     ngx_free(path_data);
                     return NGX_ERROR;
+                } else {
+                    ngx_log_error(NGX_LOG_INFO, log, 0,
+                                  "directory created by another worker: %s", path_data);
                 }
+            } else {
+                ngx_log_error(NGX_LOG_INFO, log, 0,
+                              "created directory for peers file: %s", path_data);
             }
         }
         *dir_end = '/';
@@ -777,11 +798,15 @@ ngx_dynamic_upstream_save_peers(ngx_str_t *upstream_name, ngx_log_t *log)
 
     f = fopen((const char *) path_data, "w");
     if (f == NULL) {
-        ngx_log_error(NGX_LOG_WARN, log, errno,
-                      "can't open peers file for writing: %s", path_data);
+        ngx_log_error(NGX_LOG_ERR, log, errno,
+                      "can't open peers file for writing: %s (errno: %d, check permissions)",
+                      path_data, errno);
         ngx_free(path_data);
         return NGX_ERROR;
     }
+    
+    ngx_log_error(NGX_LOG_DEBUG, log, 0,
+                  "opened peers file for writing: %s", path_data);
 
     ngx_rwlock_rlock(&peers->rwlock);
 
@@ -789,18 +814,12 @@ ngx_dynamic_upstream_save_peers(ngx_str_t *upstream_name, ngx_log_t *log)
         /* Format: server ADDRESS weight=W max_fails=M fail_timeout=T max_conns=C backup down; */
         fprintf(f, "server %.*s", (int)peer->server.len, peer->server.data);
         
-        if (peer->weight != 1) {
-            fprintf(f, " weight=%u", (unsigned int)peer->weight);
-        }
-        if (peer->max_fails != 1) {
-            fprintf(f, " max_fails=%u", (unsigned int)peer->max_fails);
-        }
-        if (peer->fail_timeout != 10000) {
-            fprintf(f, " fail_timeout=%lu", (unsigned long)peer->fail_timeout);
-        }
-        if (peer->max_conns != 0) {
-            fprintf(f, " max_conns=%u", (unsigned int)peer->max_conns);
-        }
+        /* Always save weight, max_fails, fail_timeout, max_conns for consistency */
+        fprintf(f, " weight=%u", (unsigned int)peer->weight);
+        fprintf(f, " max_fails=%u", (unsigned int)peer->max_fails);
+        fprintf(f, " fail_timeout=%lu", (unsigned long)peer->fail_timeout);
+        fprintf(f, " max_conns=%u", (unsigned int)peer->max_conns);
+        
         /* Note: backup field may not exist in all Nginx versions */
         if (peer->down) {
             fprintf(f, " down");
@@ -811,11 +830,22 @@ ngx_dynamic_upstream_save_peers(ngx_str_t *upstream_name, ngx_log_t *log)
 
     ngx_rwlock_unlock(&peers->rwlock);
 
-    fclose(f);
-    ngx_free(path_data);
-
+    if (fflush(f) != 0) {
+        ngx_log_error(NGX_LOG_WARN, log, errno,
+                      "failed to flush peers file: %s", path_data);
+    }
+    
+    if (fclose(f) != 0) {
+        ngx_log_error(NGX_LOG_WARN, log, errno,
+                      "failed to close peers file: %s", path_data);
+        ngx_free(path_data);
+        return NGX_ERROR;
+    }
+    
     ngx_log_error(NGX_LOG_INFO, log, 0,
-                  "saved peers for upstream %V to file", upstream_name);
+                  "saved peers for upstream %V to file %s", upstream_name, path_data);
+    
+    ngx_free(path_data);
 
     return NGX_OK;
 }
