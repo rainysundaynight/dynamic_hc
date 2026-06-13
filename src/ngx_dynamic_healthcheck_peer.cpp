@@ -711,7 +711,7 @@ ngx_dynamic_healthcheck_match_buffer(ngx_str_t *pattern, ngx_str_t *s)
         return NGX_ERROR;
     }
 
-    int captures[(1 + rc.captures) * 3];
+    int captures[30]; // Fixed size instead of VLA
     int m = ngx_regex_exec(rc.regex, s, captures, (1 + rc.captures) * 3);
 
     ngx_destroy_pool(rc.pool);

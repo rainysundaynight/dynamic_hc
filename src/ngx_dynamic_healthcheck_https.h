@@ -16,12 +16,10 @@ extern "C" {
 template <class PeersT, class PeerT> class ngx_dynamic_healthcheck_https :
     public ngx_dynamic_healthcheck_http<PeersT, PeerT>
 {
-private:
+protected:
     SSL                   *ssl_connection;
     SSL_CTX               *ssl_ctx;
     ngx_flag_t            ssl_handshake_done;
-
-protected:
 
     virtual ngx_int_t
     on_ssl_handshake(ngx_dynamic_hc_local_node_t *state)

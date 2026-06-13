@@ -22,6 +22,8 @@ HTTP_DYNAMIC_HC_DEPS="                                      \
     $ngx_addon_dir/src/ngx_dynamic_healthcheck_tcp.h        \
     $ngx_addon_dir/src/ngx_dynamic_healthcheck_http.h       \
     $ngx_addon_dir/src/ngx_dynamic_healthcheck_https.h       \
+    $ngx_addon_dir/src/ngx_dynamic_healthcheck_grpc.h       \
+    $ngx_addon_dir/src/ngx_dynamic_healthcheck_grpcs.h      \
     $ngx_addon_dir/src/ngx_dynamic_healthcheck_api.h        \
     $ngx_addon_dir/src/ngx_dynamic_healthcheck_config.h     \
     $ngx_addon_dir/src/ngx_dynamic_shm.h                    \

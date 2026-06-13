@@ -14,6 +14,8 @@ extern "C" {
 #include "ngx_dynamic_healthcheck_http.h"
 #include "ngx_dynamic_healthcheck_ssl.h"
 #include "ngx_dynamic_healthcheck_https.h"
+#include "ngx_dynamic_healthcheck_grpc.h"
+#include "ngx_dynamic_healthcheck_grpcs.h"
 
 
 static void
@@ -162,6 +164,18 @@ do_check_private(S *uscf, ngx_dynamic_healthcheck_event_t *event)
                 addr = ngx_calloc(sizeof(ngx_dynamic_healthcheck_https<PeersT,
                                                                        PeerT>),
                                   event->log);
+
+            else if (type.len == 4 && ngx_memcmp(type.data, "grpc", 4) == 0)
+
+                addr = ngx_calloc(sizeof(ngx_dynamic_healthcheck_grpc<PeersT,
+                                                                      PeerT>),
+                                  event->log);
+
+            else if (type.len == 5 && ngx_memcmp(type.data, "grpcs", 5) == 0)
+
+                addr = ngx_calloc(sizeof(ngx_dynamic_healthcheck_grpcs<PeersT,
+                                                                       PeerT>),
+                                  event->log);
             else
                 goto end;
 
@@ -190,6 +204,18 @@ do_check_private(S *uscf, ngx_dynamic_healthcheck_event_t *event)
 
                 p = new (addr)
                     ngx_dynamic_healthcheck_https<PeersT, PeerT>(primary, event,
+                        state);
+
+            else if (type.len == 4 && ngx_memcmp(type.data, "grpc", 4) == 0)
+
+                p = new (addr)
+                    ngx_dynamic_healthcheck_grpc<PeersT, PeerT>(primary, event,
+                        state);
+
+            else if (type.len == 5 && ngx_memcmp(type.data, "grpcs", 5) == 0)
+
+                p = new (addr)
+                    ngx_dynamic_healthcheck_grpcs<PeersT, PeerT>(primary, event,
                         state);
 
             else
