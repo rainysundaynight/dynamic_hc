@@ -393,17 +393,22 @@ ngx_http_dynamic_healthcheck_init_peers(ngx_dynamic_healthcheck_conf_t *conf)
                 continue;
             if (ngx_peer_disabled(&peer->name, conf)
                 || ngx_peer_disabled(&peer->server, conf)) {
-                if (!peer->down) {
-                    peer->down = 1;
-                    peers->tries--;
+                if (!(peer->down & 1)) {
+                    peer->down |= 1;
+                    ngx_atomic_fetch_add((ngx_atomic_uint_t *)&peers->tries, -1);
                 }
                 continue;
             }
             if (ngx_dynamic_healthcheck_state_stat(&conf->peers,
                     &peer->server, &peer->name, &stat) == NGX_OK) {
-                if (peer->down != (ngx_uint_t) stat.down) {
-                    peer->down = stat.down;
-                    peers->tries += stat.down ? -1 : 1;
+                if ((peer->down & 1) != (stat.down ? 1 : 0)) {
+                    if (stat.down) {
+                        peer->down |= 1;
+                        ngx_atomic_fetch_add((ngx_atomic_uint_t *)&peers->tries, -1);
+                    } else {
+                        peer->down &= ~1;
+                        ngx_atomic_fetch_add((ngx_atomic_uint_t *)&peers->tries, 1);
+                    }
                 }
             }
         }
@@ -1290,7 +1295,7 @@ ngx_http_dynamic_healthcheck_status_hc(ngx_http_request_t *r,
                     "%V            \"rise\":%d,"        CRLF
                     "%V            \"fall_total\":%d,"  CRLF
                     "%V            \"rise_total\":%d"   CRLF,
-                        &tab, peer->down,
+                        &tab, peer->down & 1,
                         &tab, stat.fall,
                         &tab, stat.rise,
                         &tab, stat.fall_total,

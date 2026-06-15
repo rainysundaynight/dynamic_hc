@@ -13,6 +13,12 @@ template <class PeersT, class PeerT> class ngx_dynamic_healthcheck_grpcs :
     public ngx_dynamic_healthcheck_https<PeersT, PeerT>
 {
 protected:
+    virtual void set_alpn() {
+#ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
+        SSL_set_alpn_protos(this->ssl_connection, (const unsigned char *) "\x02h2", 3);
+#endif
+    }
+
     virtual ngx_int_t
     on_send(ngx_dynamic_hc_local_node_t *state)
     {
@@ -38,7 +44,14 @@ protected:
         }
 
         int ssl_error = SSL_get_error(this->ssl_connection, n);
-        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+        if (ssl_error == SSL_ERROR_WANT_READ) {
+            if (state->pc.connection->read->handler != state->pc.connection->write->handler) {
+                state->pc.connection->read->handler = state->pc.connection->write->handler;
+            }
+            ngx_handle_read_event(state->pc.connection->read, 0);
+            return NGX_AGAIN;
+        } else if (ssl_error == SSL_ERROR_WANT_WRITE) {
+            ngx_handle_write_event(state->pc.connection->write, 0);
             return NGX_AGAIN;
         }
 
@@ -76,7 +89,14 @@ protected:
         }
 
         int ssl_error = SSL_get_error(this->ssl_connection, n);
-        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+        if (ssl_error == SSL_ERROR_WANT_READ) {
+            ngx_handle_read_event(state->pc.connection->read, 0);
+            return NGX_AGAIN;
+        } else if (ssl_error == SSL_ERROR_WANT_WRITE) {
+            if (state->pc.connection->write->handler != state->pc.connection->read->handler) {
+                state->pc.connection->write->handler = state->pc.connection->read->handler;
+            }
+            ngx_handle_write_event(state->pc.connection->write, 0);
             return NGX_AGAIN;
         }
 

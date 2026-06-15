@@ -21,6 +21,12 @@ protected:
     SSL_CTX               *ssl_ctx;
     ngx_flag_t            ssl_handshake_done;
 
+    virtual void set_alpn() {
+#ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
+        SSL_set_alpn_protos(ssl_connection, (const unsigned char *) "\x08http/1.1", 9);
+#endif
+    }
+
     virtual ngx_int_t
     on_ssl_handshake(ngx_dynamic_hc_local_node_t *state)
     {
@@ -70,15 +76,31 @@ protected:
             // Set SSL mode for client connection
             SSL_set_connect_state(ssl_connection);
             
+            // Allow subclasses to set ALPN
+            set_alpn();
+            
             // Set SNI using original server name from configuration
             // Use state->server instead of state->name to preserve domain name
             // (state->name may contain IP address after DNS resolution)
             if (state->server.len > 0) {
                 ngx_str_t hostname = state->server;
-                // Remove port if present
-                u_char *colon = (u_char *) ngx_strchr(hostname.data, ':');
+                
+                // Remove port if present, safely handling IPv6 literals
+                u_char *colon = (u_char *) ngx_strrchr(hostname.data, ':');
+                u_char *bracket = (u_char *) ngx_strchr(hostname.data, ']');
                 if (colon != NULL) {
-                    hostname.len = colon - hostname.data;
+                    if (bracket == NULL || colon > bracket) {
+                        hostname.len = colon - hostname.data;
+                    }
+                }
+                
+                // If IPv6 literal, strip brackets for SNI checks
+                if (hostname.len > 0 && hostname.data[0] == '[') {
+                    hostname.data++;
+                    hostname.len--;
+                    if (hostname.len > 0 && hostname.data[hostname.len-1] == ']') {
+                        hostname.len--;
+                    }
                 }
                 
                 // Only set SNI if it looks like a domain name (not IP address)
@@ -129,12 +151,17 @@ protected:
 
         int ssl_error = SSL_get_error(ssl_connection, rc);
         
-        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
-            // Handshake needs more data
-            ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
-                          "[%V] %V: %V addr=%V, fd=%d SSL handshake in progress",
-                          &this->module, &this->upstream,
-                          &this->server, &this->name, c->fd);
+        if (ssl_error == SSL_ERROR_WANT_READ) {
+            if (c->read->handler != c->write->handler) {
+                c->read->handler = c->write->handler;
+            }
+            ngx_handle_read_event(c->read, 0);
+            return NGX_AGAIN;
+        } else if (ssl_error == SSL_ERROR_WANT_WRITE) {
+            if (c->write->handler != c->read->handler) {
+                c->write->handler = c->read->handler;
+            }
+            ngx_handle_write_event(c->write, 0);
             return NGX_AGAIN;
         }
 
@@ -186,7 +213,14 @@ protected:
 
         int ssl_error = SSL_get_error(ssl_connection, n);
         
-        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+        if (ssl_error == SSL_ERROR_WANT_READ) {
+            if (c->read->handler != c->write->handler) {
+                c->read->handler = c->write->handler;
+            }
+            ngx_handle_read_event(c->read, 0);
+            return NGX_AGAIN;
+        } else if (ssl_error == SSL_ERROR_WANT_WRITE) {
+            ngx_handle_write_event(c->write, 0);
             return NGX_AGAIN;
         }
 
@@ -247,4 +281,3 @@ public:
 };
 
 #endif /* NGX_DYNAMIC_HEALTHCHECK_HTTPS_H */
-

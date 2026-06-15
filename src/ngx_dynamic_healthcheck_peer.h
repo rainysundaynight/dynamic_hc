@@ -155,9 +155,9 @@ protected:
 
             ngx_rwlock_wlock(&peer->lock);
 
-            if (peer->down) {
-                peers->tries++;
-                peer->down = 0;
+            if (peer->down & 1) {
+                ngx_atomic_fetch_add((ngx_atomic_uint_t *)&peers->tries, 1);
+                peer->down &= ~1;
                 ngx_log_error(NGX_LOG_NOTICE, event->log, 0,
                               "[%V] %V: %V addr=%V up",
                               &module, &upstream, &server, &name);
@@ -181,9 +181,9 @@ protected:
 
             ngx_rwlock_wlock(&peer->lock);
 
-            if (!peer->down) {
-                peers->tries--;
-                peer->down = 1;
+            if (!(peer->down & 1)) {
+                ngx_atomic_fetch_add((ngx_atomic_uint_t *)&peers->tries, -1);
+                peer->down |= 1;
                 if (!skip) {
                     ngx_log_error(NGX_LOG_WARN, event->log, 0,
                                   "[%V] %V: %V addr=%V down",
