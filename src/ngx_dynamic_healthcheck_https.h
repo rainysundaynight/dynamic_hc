@@ -86,8 +86,17 @@ protected:
                 ngx_str_t hostname = state->server;
                 
                 // Remove port if present, safely handling IPv6 literals
-                u_char *colon = (u_char *) ngx_strrchr(hostname.data, ':');
-                u_char *bracket = (u_char *) ngx_strchr(hostname.data, ']');
+                u_char *colon = NULL;
+                u_char *bracket = NULL;
+                for (ngx_int_t i = hostname.len - 1; i >= 0; i--) {
+                    if (hostname.data[i] == ':' && colon == NULL) {
+                        colon = &hostname.data[i];
+                    }
+                    if (hostname.data[i] == ']' && bracket == NULL) {
+                        bracket = &hostname.data[i];
+                    }
+                }
+                
                 if (colon != NULL) {
                     if (bracket == NULL || colon > bracket) {
                         hostname.len = colon - hostname.data;
