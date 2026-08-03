@@ -139,7 +139,8 @@ do_check_private(S *uscf, ngx_dynamic_healthcheck_event_t *event)
             state.local->module = event->conf->config.module;
             state.local->upstream = event->conf->config.upstream;
 
-            state.shared->down = peer->down;
+            /* синхронизируем только бит FAILED, не draining/прочие флаги */
+            state.shared->down = (peer->down & 1) ? 1 : 0;
 
             if (type.len == 3 && ngx_memcmp(type.data, "tcp", 3) == 0)
 

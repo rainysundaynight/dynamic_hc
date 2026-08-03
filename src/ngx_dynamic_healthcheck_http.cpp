@@ -5,6 +5,8 @@ extern "C" {
 #include <ngx_core.h>
 #include <ngx_http.h>
 #include <assert.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 }
 
@@ -31,6 +33,7 @@ healthcheck_http_helper::make_request(ngx_dynamic_healthcheck_opts_t *shared,
     ngx_flag_t                       is_unix_socket;
     ngx_uint_t                       keepalive = shared->keepalive;
     static ngx_str_t                 Host = ngx_string("Host");
+    in_port_t                        port;
 
     ngx_str_null(&host);
 
@@ -64,18 +67,14 @@ healthcheck_http_helper::make_request(ngx_dynamic_healthcheck_opts_t *shared,
         buf->last = ngx_snprintf(buf->last, buf->end - buf->last,
             "Host: %V\r\n", &host);
     } else if (!is_unix_socket) {
-        // Use state->server (original domain name from config) instead of 
-        // state->name (which may contain IP after DNS resolution)
-        // This is important for HTTPS to use correct domain name in Host header
-        host = state->server;
-        
-        // Remove port if present
-        for (; host.len > 0 && host.data[host.len - 1] != ':';
-               host.len--);
-        host.len--;
-        
-        // Check if we need to add port
-        in_port_t port = get_in_port(state->sockaddr);
+
+        /* ---------- Host из server ----------
+         * Берём hostname без порта (IPv6-safe). Не режем строку без ':'.
+         */
+
+        host = get_host(&state->server);
+
+        port = get_in_port(state->sockaddr);
         if (port != 0 && port != 80 && port != 443) {
             buf->last = ngx_snprintf(buf->last, buf->end - buf->last,
                 "Host: %V:%d\r\n", &host, port);
@@ -187,12 +186,11 @@ healthcheck_http_helper::receive_data(ngx_dynamic_hc_local_node_t *state)
         return NGX_ERROR;
     }
 
-    // Check if this is an SSL connection by checking if SSL is set on connection
-    // For HTTPS health checks, we need to use SSL_read instead of c->recv
-    // We'll detect this by checking if connection has SSL data
-    // For now, use standard recv - HTTPS class will override on_recv to handle SSL
-    
-    // Check if this is an SSL connection (for HTTPS health checks)
+    /* ---------- SSL recv ----------
+     * HTTPS healthcheck читает через SSL_read; WANT_READ/WRITE
+     * должны перевешивать event handlers, иначе зависание на EPOLLET.
+     */
+
     if (ssl_conn_ptr != NULL) {
         SSL *ssl_conn = (SSL *)ssl_conn_ptr;
         int n;
@@ -207,7 +205,21 @@ healthcheck_http_helper::receive_data(ngx_dynamic_hc_local_node_t *state)
         } else {
             int ssl_error = SSL_get_error(ssl_conn, n);
             
-            if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+            if (ssl_error == SSL_ERROR_WANT_READ) {
+                if (c->read->handler != c->write->handler
+                    && c->write->handler != NULL)
+                {
+                    /* keep current read handler from peer state machine */
+                }
+                ngx_handle_read_event(c->read, 0);
+                return NGX_AGAIN;
+            }
+
+            if (ssl_error == SSL_ERROR_WANT_WRITE) {
+                if (c->write->handler != c->read->handler) {
+                    c->write->handler = c->read->handler;
+                }
+                ngx_handle_write_event(c->write, 0);
                 return NGX_AGAIN;
             }
             
@@ -216,8 +228,10 @@ healthcheck_http_helper::receive_data(ngx_dynamic_hc_local_node_t *state)
                 eof = 1;
             } else {
                 ngx_log_error(NGX_LOG_ERR, c->log, 0,
-                              "[%V] %V: %V addr=%V, fd=%d SSL_read() failed, error=%d",
-                              &module, &upstream, &server, &name, c->fd, ssl_error);
+                              "[%V] %V: %V addr=%V, fd=%d SSL_read() failed,"
+                              " error=%d",
+                              &module, &upstream, &server, &name, c->fd,
+                              ssl_error);
                 return NGX_ERROR;
             }
         }
@@ -225,7 +239,6 @@ healthcheck_http_helper::receive_data(ngx_dynamic_hc_local_node_t *state)
         eof = (n == 0 || (SSL_get_shutdown(ssl_conn) & SSL_RECEIVED_SHUTDOWN));
         c->read->eof = eof;
     } else {
-        // Regular HTTP connection
         if (remains == 0)
             size = c->recv(c, buf->last, buf->end - buf->last);
         else

@@ -479,9 +479,11 @@ ngx_http_dynamic_healthcheck_init_srv_conf(ngx_conf_t *cf,
         main_conf->config.persistent);
 
     if (conf->config.type.data != NULL
-        && (ngx_strncmp(conf->config.type.data, "http", 4) == 0
-            || (conf->config.type.len == 5 
+        && ((conf->config.type.len == 4
+             && ngx_strncmp(conf->config.type.data, "http", 4) == 0)
+            || (conf->config.type.len == 5
                 && ngx_strncmp(conf->config.type.data, "https", 5) == 0)))
+    {
         if (conf->config.request_uri.len == 0) {
             ngx_str_null(&conf->config.request_method);
             ngx_memzero(&conf->config.request_headers,
@@ -492,6 +494,23 @@ ngx_http_dynamic_healthcheck_init_srv_conf(ngx_conf_t *cf,
             conf->config.keepalive = 1;
             ngx_memzero(&conf->config.response_codes, sizeof(ngx_num_array_t));
         }
+    }
+
+    /* ---------- keepalive для TLS/gRPC ----------
+     * HTTPS/gRPC/gRPCS нельзя безопасно переиспользовать через TCP keepalive
+     * модуля: SSL_free рвёт сессию, HTTP/2 preface нельзя слать повторно.
+     */
+
+    if (conf->config.type.data != NULL
+        && ((conf->config.type.len == 5
+             && ngx_strncmp(conf->config.type.data, "https", 5) == 0)
+            || (conf->config.type.len == 4
+                && ngx_strncmp(conf->config.type.data, "grpc", 4) == 0)
+            || (conf->config.type.len == 5
+                && ngx_strncmp(conf->config.type.data, "grpcs", 5) == 0)))
+    {
+        conf->config.keepalive = 1;
+    }
 
     conf->config.buffer_size = main_conf->config.buffer_size;
     conf->config.disabled_hosts_global =
@@ -504,33 +523,33 @@ ngx_http_dynamic_healthcheck_init_srv_conf(ngx_conf_t *cf,
         return NGX_ERROR;
     }
 
-    // Initialize SSL context if HTTPS checks are enabled
-    // Use main_conf SSL context if available, otherwise create new one
+    /* ---------- SSL context для https/grpcs ----------
+     * Клиентский SSL_CTX нужен и для HTTPS, и для gRPC over TLS healthcheck.
+     * Без него type=grpcs сразу падает → peer down → 502 no live upstreams.
+     */
+
     if (conf->config.type.data != NULL
-        && conf->config.type.len == 5
-        && ngx_strncmp(conf->config.type.data, "https", 5) == 0) {
-        
+        && ((conf->config.type.len == 5
+             && ngx_strncmp(conf->config.type.data, "https", 5) == 0)
+            || (conf->config.type.len == 5
+                && ngx_strncmp(conf->config.type.data, "grpcs", 5) == 0)))
+    {
         if (main_conf->ssl_ctx == NULL) {
-            // Create SSL context for client connections
             SSL_CTX *ctx = SSL_CTX_new(SSLv23_client_method());
             if (ctx == NULL) {
                 ngx_log_error(NGX_LOG_ERR, cf->log, 0,
-                    "failed to create SSL context for HTTPS healthchecks");
+                    "failed to create SSL context for HTTPS/gRPCS healthchecks");
                 return NGX_ERROR;
             }
 
-            // Set options for client connections
             SSL_CTX_set_options(ctx,
                 SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_COMPRESSION);
-            
-            // Enable SNI support
+
             SSL_CTX_set_client_cert_cb(ctx, NULL);
-            
-            // Store as void* in configuration
+
             main_conf->ssl_ctx = (void *)ctx;
         }
-        
-        // Use main config SSL context
+
         conf->ssl_ctx = main_conf->ssl_ctx;
     }
 
@@ -707,9 +726,11 @@ static ngx_chain_t *
 ngx_http_dynamic_healthcheck_get_hc(ngx_http_request_t *r,
     ngx_dynamic_healthcheck_opts_t *shared, ngx_str_t tab)
 {
-    ngx_flag_t   is_http = (ngx_strncmp(shared->type.data, "http", 4) == 0
-                            || (shared->type.len == 5 
-                                && ngx_strncmp(shared->type.data, "https", 5) == 0));
+    ngx_flag_t   is_http = ((shared->type.len == 4
+                             && ngx_strncmp(shared->type.data, "http", 4) == 0)
+                            || (shared->type.len == 5
+                                && ngx_strncmp(shared->type.data, "https", 5)
+                                   == 0));
     ngx_chain_t *out = (ngx_chain_t *) ngx_pcalloc(r->pool,
                                                    sizeof(ngx_chain_t));
     ngx_str_array_t disabled[2] = {

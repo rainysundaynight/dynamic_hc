@@ -357,7 +357,9 @@ ngx_stream_dynamic_healthcheck_init_srv_conf(ngx_conf_t *cf,
         main_conf->config.persistent);
 
     if (conf->config.type.data != NULL
+        && conf->config.type.len == 4
         && ngx_strncmp(conf->config.type.data, "http", 4) == 0)
+    {
         if (conf->config.request_uri.len == 0) {
             ngx_str_null(&conf->config.request_method);
             ngx_memzero(&conf->config.request_headers,
@@ -368,6 +370,7 @@ ngx_stream_dynamic_healthcheck_init_srv_conf(ngx_conf_t *cf,
             conf->config.keepalive = 1;
             ngx_memzero(&conf->config.response_codes, sizeof(ngx_num_array_t));
         }
+    }
 
     conf->config.buffer_size = main_conf->config.buffer_size;
     conf->config.disabled_hosts_global =

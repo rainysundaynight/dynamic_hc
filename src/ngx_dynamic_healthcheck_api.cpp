@@ -124,9 +124,18 @@ ngx_dynamic_healthcheck_api_base::do_disable_host
                              peer->server.len, host->len) == 0
                 || ngx_memn2cmp(peer->name.data, host->data,
                                 peer->name.len, host->len) == 0) {
-                if (peer->down != (ngx_uint_t) disable) {
-                    peer->down = disable;
-                    peers->tries += disable ? -1 : 1;
+                if (disable) {
+                    if (!(peer->down & 1)) {
+                        peer->down |= 1;
+                        ngx_atomic_fetch_add(
+                            (ngx_atomic_uint_t *) &peers->tries, -1);
+                    }
+                } else {
+                    if (peer->down & 1) {
+                        peer->down &= ~1;
+                        ngx_atomic_fetch_add(
+                            (ngx_atomic_uint_t *) &peers->tries, 1);
+                    }
                 }
             }
         }
@@ -156,9 +165,18 @@ ngx_dynamic_healthcheck_api_base::do_disable_host
                              peer->server.len, host->len) == 0
                 || ngx_memn2cmp(peer->name.data, host->data,
                                 peer->name.len, host->len) == 0) {
-                if (peer->down != (ngx_uint_t) disable) {
-                    peer->down = disable;
-                    peers->tries += disable ? -1 : 1;
+                if (disable) {
+                    if (!(peer->down & 1)) {
+                        peer->down |= 1;
+                        ngx_atomic_fetch_add(
+                            (ngx_atomic_uint_t *) &peers->tries, -1);
+                    }
+                } else {
+                    if (peer->down & 1) {
+                        peer->down &= ~1;
+                        ngx_atomic_fetch_add(
+                            (ngx_atomic_uint_t *) &peers->tries, 1);
+                    }
                 }
             }
         }
@@ -705,7 +723,7 @@ get_status(lua_State *L, ngx_dynamic_healthcheck_conf_t *conf)
                 lua_pushinteger(L, stat.rise_total);
                 lua_setfield(L, -2, "rise_total");
 
-                lua_pushinteger(L, peer->down);
+                lua_pushinteger(L, peer->down & 1);
                 lua_setfield(L, -2, "down");
 
                 lua_rawset(L, -3);

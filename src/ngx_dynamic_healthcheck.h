@@ -170,12 +170,28 @@ public:
 ngx_inline ngx_str_t
 get_host(ngx_str_t *name)
 {
-    ngx_str_t  s = *name;
-    u_char    *c;
+    ngx_str_t   s = *name;
+    ngx_int_t   i;
+    u_char     *colon = NULL;
+    u_char     *bracket = NULL;
 
-    c = ngx_strlchr(name->data, name->data + name->len, ':');
-    if (c != NULL)
-        s.len = c - name->data;
+    /* ---------- Host без порта ----------
+     * Корректно отрезает :port, учитывая IPv6 [addr]:port.
+     * Раньше ngx_strlchr брал первое ':' и ломал IPv6.
+     */
+
+    for (i = (ngx_int_t) s.len - 1; i >= 0; i--) {
+        if (s.data[i] == ':' && colon == NULL) {
+            colon = &s.data[i];
+        }
+        if (s.data[i] == ']' && bracket == NULL) {
+            bracket = &s.data[i];
+        }
+    }
+
+    if (colon != NULL && (bracket == NULL || colon > bracket)) {
+        s.len = (size_t) (colon - s.data);
+    }
 
     return s;
 }
